@@ -2,13 +2,15 @@
 
 `PonsV2TwoWayFeeSplitter` is an optional creator-fee recipient for teams that
 want to divide pons v2 proceeds between two fixed wallets. It supports native
-ETH and every ERC-20 supported by the pons fee escrow.
+ETH and standard ERC-20s with exact, stable transfer accounting.
 
 The recipients and ratio are immutable. Each recipient's share is configured as
 an integer number of units, both shares must be non-zero and add to 20, and each
 unit represents 5%. The supported range is therefore 5%/95% through 95%/5%.
 Fractional remainders carry across allocations, so splitting funds into many
 small allocations produces the same result as allocating the total once.
+Neither recipient may be the splitter itself, including when its deployment
+address is predicted in advance.
 
 Either recipient's accrued balance can be released independently, so a
 recipient that rejects ETH does not block the other recipient.
@@ -98,3 +100,32 @@ splitter.releaseToken(IERC20(pairToken), recipientTwo);
 
 Direct transfers are handled with `allocateNative()` and `allocateToken(token)`.
 Failed releases preserve the recipient's pending balance for a later retry.
+
+## ERC-20 requirements
+
+Only ERC-20s for which an exact transfer reduces the splitter's balance and
+increases the recipient's balance by the requested amount are supported. A
+release reverts and preserves its pending balance if either balance delta is
+not exact. If the splitter's token balance falls below the total pending amount,
+all releases remain blocked until full backing is restored so release order
+cannot determine which recipient absorbs a loss.
+
+Fee-on-transfer, negative-rebase, blocklisting, and otherwise mutable or
+upgradeable token behavior can violate those assumptions and is unsupported.
+Positive rebases or unsolicited transfers remain unallocated until someone
+calls `allocateToken(token)`.
+
+## Robinhood Chain fork verification
+
+The integration test uses the deployed pons v2 factory at
+`0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e` and its live fee escrow on a
+local fork. It verifies native and ERC-20 credit, claim, split, and release
+semantics without broadcasting a transaction:
+
+```sh
+ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com \
+  forge test --match-contract PonsV2TwoWayFeeSplitterForkTest -vv
+```
+
+The fork test is skipped when `ROBINHOOD_RPC_URL` is unset, so the offline unit
+suite remains deterministic.

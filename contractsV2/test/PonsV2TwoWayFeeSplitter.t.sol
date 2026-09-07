@@ -5,6 +5,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IPonsV2FeeEscrow} from "../src/v2/interfaces/ILaunchpadV2.sol";
 import {IPonsV2CreatorControls, PonsV2TwoWayFeeSplitter} from "../src/v2/utilities/PonsV2TwoWayFeeSplitter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {MockPonsV2CreatorControls} from "./mocks/MockPonsV2CreatorControls.sol";
 import {MockPonsV2FeeEscrow} from "./mocks/MockPonsV2FeeEscrow.sol";
 
@@ -37,6 +38,26 @@ contract ReentrantNativeRecipient {
             (reentrySucceeded,) =
                 address(splitter).call(abi.encodeCall(PonsV2TwoWayFeeSplitter.releaseNative, (address(this))));
         }
+    }
+}
+
+contract SelfRecipientFactory {
+    function deploy(IPonsV2FeeEscrow feeEscrow, address payable otherRecipient, bool selfIsRecipientOne)
+        external
+        returns (PonsV2TwoWayFeeSplitter)
+    {
+        address payable predictedSplitter = payable(nextCreateAddress());
+        address payable first = selfIsRecipientOne ? predictedSplitter : otherRecipient;
+        address payable second = selfIsRecipientOne ? otherRecipient : predictedSplitter;
+
+        return
+            new PonsV2TwoWayFeeSplitter(
+                feeEscrow, first, second, 10, 10, IPonsV2CreatorControls(address(0)), address(0)
+            );
+    }
+
+    function nextCreateAddress() public view returns (address) {
+        return address(uint160(uint256(keccak256(abi.encodePacked(hex"d694", address(this), hex"01")))));
     }
 }
 
@@ -254,6 +275,44 @@ contract PonsV2TwoWayFeeSplitterTest {
         _assertEq(token.balanceOf(RECIPIENT_ONE), 8);
     }
 
+    function testRejectsFeeOnTransferTokenWithoutChangingAccounting() public {
+        MockFeeOnTransferERC20 feeToken = new MockFeeOnTransferERC20();
+        feeToken.mint(address(splitter), 100);
+        splitter.allocateToken(feeToken);
+
+        VM.expectRevert(
+            abi.encodeWithSelector(
+                PonsV2TwoWayFeeSplitter.InexactTokenTransfer.selector, address(feeToken), RECIPIENT_ONE, 80, 80, 72
+            )
+        );
+        splitter.releaseToken(feeToken, RECIPIENT_ONE);
+
+        _assertEq(feeToken.balanceOf(address(splitter)), 100);
+        _assertEq(feeToken.balanceOf(RECIPIENT_ONE), 0);
+        _assertEq(splitter.pendingToken(address(feeToken), RECIPIENT_ONE), 80);
+        _assertEq(splitter.pendingToken(address(feeToken), RECIPIENT_TWO), 20);
+    }
+
+    function testUndercollateralizedTokenBlocksEveryReleaseUntilRestored() public {
+        token.mint(address(splitter), 100);
+        splitter.allocateToken(token);
+        token.burn(address(splitter), 1);
+
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.AccountingInvariant.selector);
+        splitter.releaseToken(token, RECIPIENT_ONE);
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.AccountingInvariant.selector);
+        splitter.releaseToken(token, RECIPIENT_TWO);
+
+        _assertEq(splitter.pendingToken(address(token), RECIPIENT_ONE), 80);
+        _assertEq(splitter.pendingToken(address(token), RECIPIENT_TWO), 20);
+
+        token.mint(address(splitter), 1);
+        splitter.releaseToken(token, RECIPIENT_ONE);
+        splitter.releaseToken(token, RECIPIENT_TWO);
+        _assertEq(token.balanceOf(RECIPIENT_ONE), 80);
+        _assertEq(token.balanceOf(RECIPIENT_TWO), 20);
+    }
+
     function testNativeReleaseCannotBeReentered() public {
         ReentrantNativeRecipient attacker = new ReentrantNativeRecipient();
         PonsV2TwoWayFeeSplitter guarded =
@@ -315,6 +374,16 @@ contract PonsV2TwoWayFeeSplitterTest {
 
         VM.expectRevert(PonsV2TwoWayFeeSplitter.InvalidControllerConfiguration.selector);
         _deploy(RECIPIENT_ONE, RECIPIENT_TWO, 10, 10, address(controls), address(0));
+    }
+
+    function testRejectsPredictedSplitterAsEitherRecipient() public {
+        SelfRecipientFactory firstFactory = new SelfRecipientFactory();
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.SelfRecipient.selector);
+        firstFactory.deploy(IPonsV2FeeEscrow(address(escrow)), RECIPIENT_TWO, true);
+
+        SelfRecipientFactory secondFactory = new SelfRecipientFactory();
+        VM.expectRevert(PonsV2TwoWayFeeSplitter.SelfRecipient.selector);
+        secondFactory.deploy(IPonsV2FeeEscrow(address(escrow)), RECIPIENT_ONE, false);
     }
 
     function testUnknownRecipientCannotBeReleased() public {

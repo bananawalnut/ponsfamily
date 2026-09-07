@@ -27,6 +27,11 @@ interface IPonsV2CreatorControls {
  * forced transfers, and release either recipient's balance. No caller can
  * change the economic terms or redirect the held funds.
  *
+ * ERC-20 releases require exact, stable balance accounting: the splitter
+ * must spend exactly the pending amount and the recipient must receive that
+ * same amount. Fee-on-transfer, rebasing, blocklisting, and other tokens with
+ * mutable or non-standard transfer semantics are not supported.
+ *
  * An optional immutable controller preserves the two actions pons reserves
  * for the current creator fee recipient: transferring future creator fees
  * and enabling or disabling buybacks. Configure both `creatorControls_` and
@@ -57,6 +62,7 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
 
     error ZeroAddress();
     error DuplicateRecipient();
+    error SelfRecipient();
     error InvalidShareUnits();
     error InvalidControllerConfiguration();
     error NotController();
@@ -64,6 +70,9 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
     error NothingToRelease();
     error NativeTransferFailed(address recipient, uint256 amount);
     error AccountingInvariant();
+    error InexactTokenTransfer(
+        address token, address recipient, uint256 expected, uint256 senderSpent, uint256 recipientReceived
+    );
 
     event NativeAllocated(uint256 amount, uint256 recipientOneAmount, uint256 recipientTwoAmount);
     event TokenAllocated(address indexed token, uint256 amount, uint256 recipientOneAmount, uint256 recipientTwoAmount);
@@ -90,6 +99,7 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
             revert ZeroAddress();
         }
         if (recipientOne_ == recipientTwo_) revert DuplicateRecipient();
+        if (recipientOne_ == address(this) || recipientTwo_ == address(this)) revert SelfRecipient();
         if (
             recipientOneShareUnits_ == 0 || recipientTwoShareUnits_ == 0
                 || uint16(recipientOneShareUnits_) + uint16(recipientTwoShareUnits_) != SHARE_UNITS
@@ -170,8 +180,23 @@ contract PonsV2TwoWayFeeSplitter is ReentrancyGuard {
         amount = pendingToken[address(token)][recipient];
         if (amount == 0) revert NothingToRelease();
 
+        uint256 splitterBalanceBefore = token.balanceOf(address(this));
+        uint256 totalPending = pendingToken[address(token)][recipientOne] + pendingToken[address(token)][recipientTwo];
+        if (splitterBalanceBefore < totalPending) revert AccountingInvariant();
+        uint256 recipientBalanceBefore = token.balanceOf(recipient);
+
         pendingToken[address(token)][recipient] = 0;
         token.safeTransfer(recipient, amount);
+
+        uint256 splitterBalanceAfter = token.balanceOf(address(this));
+        uint256 recipientBalanceAfter = token.balanceOf(recipient);
+        uint256 senderSpent =
+            splitterBalanceAfter <= splitterBalanceBefore ? splitterBalanceBefore - splitterBalanceAfter : 0;
+        uint256 recipientReceived =
+            recipientBalanceAfter >= recipientBalanceBefore ? recipientBalanceAfter - recipientBalanceBefore : 0;
+        if (senderSpent != amount || recipientReceived != amount) {
+            revert InexactTokenTransfer(address(token), recipient, amount, senderSpent, recipientReceived);
+        }
 
         emit TokenReleased(address(token), recipient, amount);
     }

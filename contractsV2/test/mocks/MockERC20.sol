@@ -12,6 +12,10 @@ contract MockERC20 is ERC20 {
         _mint(recipient, amount);
     }
 
+    function burn(address account, uint256 amount) external {
+        _burn(account, amount);
+    }
+
     function setFailTransfers(bool failTransfers_) external {
         failTransfers = failTransfers_;
     }
